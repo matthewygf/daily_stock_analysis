@@ -744,14 +744,18 @@ class DatabaseManager:
         """
         查询分析历史记录
         """
-        cutoff_date = datetime.now() - timedelta(days=days)
-
         with self.get_session() as session:
-            conditions = [AnalysisHistory.created_at >= cutoff_date]
-            if code:
-                conditions.append(AnalysisHistory.code == code)
+            conditions = []
+            
             if query_id:
+                # 如果提供了 query_id，直接查询，不限制时间
                 conditions.append(AnalysisHistory.query_id == query_id)
+            else:
+                # 否则按时间范围和代码查询
+                cutoff_date = datetime.now() - timedelta(days=days)
+                conditions.append(AnalysisHistory.created_at >= cutoff_date)
+                if code:
+                    conditions.append(AnalysisHistory.code == code)
 
             results = session.execute(
                 select(AnalysisHistory)

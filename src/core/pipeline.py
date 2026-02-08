@@ -145,7 +145,7 @@ class StockAnalysisPipeline:
             logger.error(f"[{code}] {error_msg}")
             return False, error_msg
     
-    def analyze_stock(self, code: str, report_type: ReportType) -> Optional[AnalysisResult]:
+    def analyze_stock(self, code: str, report_type: ReportType, query_id: Optional[str] = None) -> Optional[AnalysisResult]:
         """
         分析单只股票（增强版：含量比、换手率、筹码分析、多维度情报）
         
@@ -160,11 +160,15 @@ class StockAnalysisPipeline:
         Args:
             code: 股票代码
             report_type: 报告类型
+            query_id: 显式指定查询 ID（用于确保批量分析时每只股票 ID 唯一）
             
         Returns:
             AnalysisResult 或 None（如果分析失败）
         """
         try:
+            # 确定本次分析使用的真正 query_id
+            actual_query_id = query_id or self.query_id or ""
+            
             # 获取股票名称（优先从实时行情获取真实名称）
             stock_name = STOCK_NAME_MAP.get(code, '')
             
@@ -242,7 +246,7 @@ class StockAnalysisPipeline:
 
                     # 保存新闻情报到数据库（用于后续复盘与查询）
                     try:
-                        query_context = self._build_query_context()
+                        query_context = self._build_query_context(query_id=actual_query_id)
                         for dim_name, response in intel_results.items():
                             if response and response.success and response.results:
                                 self.db.save_news_intel(
@@ -302,7 +306,7 @@ class StockAnalysisPipeline:
                     )
                     self.db.save_analysis_history(
                         result=result,
-                        query_id=self.query_id or "",
+                        query_id=actual_query_id,
                         report_type=report_type.value,
                         news_content=news_context,
                         context_snapshot=context_snapshot,
@@ -478,12 +482,12 @@ class StockAnalysisPipeline:
             return "web"
         return "system"
 
-    def _build_query_context(self) -> Dict[str, str]:
+    def _build_query_context(self, query_id: Optional[str] = None) -> Dict[str, str]:
         """
         生成用户查询关联信息
         """
         context: Dict[str, str] = {
-            "query_id": self.query_id or "",
+            "query_id": query_id or self.query_id or "",
             "query_source": self.query_source or "",
         }
 
@@ -504,7 +508,8 @@ class StockAnalysisPipeline:
         code: str,
         skip_analysis: bool = False,
         single_stock_notify: bool = False,
-        report_type: ReportType = ReportType.SIMPLE
+        report_type: ReportType = ReportType.SIMPLE,
+        query_id: Optional[str] = None
     ) -> Optional[AnalysisResult]:
         """
         处理单只股票的完整流程
@@ -522,6 +527,7 @@ class StockAnalysisPipeline:
             skip_analysis: 是否跳过 AI 分析
             single_stock_notify: 是否启用单股推送模式（每分析完一只立即推送）
             report_type: 报告类型枚举（从配置读取，Issue #119）
+            query_id: 显式指定查询 ID（用于确保批量分析时每只股票 ID 唯一）
 
         Returns:
             AnalysisResult 或 None
@@ -541,7 +547,7 @@ class StockAnalysisPipeline:
                 logger.info(f"[{code}] 跳过 AI 分析（dry-run 模式）")
                 return None
             
-            result = self.analyze_stock(code, report_type)
+            result = self.analyze_stock(code, report_type, query_id=query_id)
             
             if result:
                 logger.info(
@@ -638,16 +644,24 @@ class StockAnalysisPipeline:
         # 注意：max_workers 设置较低（默认3）以避免触发反爬
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             # 提交任务
-            future_to_code = {
-                executor.submit(
+            future_to_code = {}
+            import uuid
+            base_query_id = self.query_id or uuid.uuid4().hex
+            
+            for code in stock_codes:
+                # 为每只股票生成唯一的 query_id，以便在历史记录中区分
+                # 即使是批量分析，每只股票也应该有自己的详情页
+                specific_query_id = f"{base_query_id}_{code}"
+                
+                future = executor.submit(
                     self.process_single_stock,
                     code,
                     skip_analysis=dry_run,
                     single_stock_notify=single_stock_notify and send_notification,
-                    report_type=report_type  # Issue #119: 传递报告类型
-                ): code
-                for code in stock_codes
-            }
+                    report_type=report_type,
+                    query_id=specific_query_id
+                )
+                future_to_code[future] = code
             
             # 收集结果
             for idx, future in enumerate(as_completed(future_to_code)):

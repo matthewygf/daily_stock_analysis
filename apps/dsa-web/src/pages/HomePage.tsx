@@ -73,6 +73,10 @@ const HomePage: React.FC = () => {
     onTaskCompleted: (task) => {
       // 刷新历史列表
       fetchHistory();
+      
+      // 自动加载并显示新完成的报告
+      handleHistoryClick(task.taskId);
+      
       // 延迟移除任务，让用户看到完成状态
       setTimeout(() => removeTask(task.taskId), 2000);
     },
@@ -154,17 +158,27 @@ const HomePage: React.FC = () => {
 
   // 点击历史项加载报告
   const handleHistoryClick = async (queryId: string) => {
-    // 取消当前分析请求的结果显示（通过递增 requestId）
-    analysisRequestIdRef.current += 1;
+    // 禁止重复点击同一项（除非需要刷新）
+    if (selectedReport?.meta.queryId === queryId && !isLoadingReport) return;
+
+    // 记录当前请求 ID，用于处理竞态条件
+    const currentRequestId = ++analysisRequestIdRef.current;
 
     setIsLoadingReport(true);
     try {
       const report = await historyApi.getDetail(queryId);
-      setSelectedReport(report);
+      
+      // 只有最新的请求才能更新状态
+      if (currentRequestId === analysisRequestIdRef.current) {
+        setSelectedReport(report);
+      }
     } catch (err) {
       console.error('Failed to fetch report:', err);
+      // 如果是最新请求且失败了，可以考虑清空当前显示或保持不变
     } finally {
-      setIsLoadingReport(false);
+      if (currentRequestId === analysisRequestIdRef.current) {
+        setIsLoadingReport(false);
+      }
     }
   };
 
@@ -296,7 +310,7 @@ const HomePage: React.FC = () => {
               <p className="mt-3 text-secondary text-sm">加载报告中...</p>
             </div>
           ) : selectedReport ? (
-            <div className="max-w-4xl">
+            <div className="max-w-4xl" key={selectedReport.meta.queryId}>
               {/* 报告内容 */}
               <ReportSummary data={selectedReport} isHistory />
             </div>

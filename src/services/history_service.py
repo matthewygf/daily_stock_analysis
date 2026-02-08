@@ -122,6 +122,7 @@ class HistoryService:
             records = self.db.get_analysis_history(query_id=query_id, limit=1)
             
             if not records:
+                logger.error(f"未找到 query_id={query_id} 的历史记录")
                 return None
             
             record = records[0]
@@ -133,6 +134,7 @@ class HistoryService:
                     raw_result = json.loads(record.raw_result)
                 except json.JSONDecodeError:
                     raw_result = record.raw_result
+                    logger.warning(f"raw_result 不是有效的 JSON: {record.raw_result}")
             
             # 解析 context_snapshot JSON
             context_snapshot = None
@@ -210,13 +212,13 @@ class HistoryService:
         Returns:
             情绪标签
         """
-        if score >= 80:
-            return "极度乐观"
-        elif score >= 60:
-            return "乐观"
-        elif score >= 40:
-            return "中性"
-        elif score >= 20:
-            return "悲观"
-        else:
+        if score <= 20:
             return "极度悲观"
+        elif score <= 40:
+            return "悲观"
+        elif score <= 60:
+            return "中性"
+        elif score <= 80:
+            return "乐观"
+        else:
+            return "极度乐观"

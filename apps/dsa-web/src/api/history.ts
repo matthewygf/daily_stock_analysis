@@ -38,7 +38,7 @@ export const historyApi = {
       total: data.total,
       page: data.page,
       limit: data.limit,
-      items: data.items.map(item => toCamelCase<HistoryItem>(item)),
+      items: data.items,
     };
   },
 

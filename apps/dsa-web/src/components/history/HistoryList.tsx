@@ -38,11 +38,7 @@ export const HistoryList: React.FC<HistoryListProps> = ({
       const target = entries[0];
       // 只有当触发器真正可见且有更多数据时才加载
       if (target.isIntersecting && hasMore && !isLoading && !isLoadingMore) {
-        // 确保容器有滚动能力（内容超过容器高度）
-        const container = scrollContainerRef.current;
-        if (container && container.scrollHeight > container.clientHeight) {
-          onLoadMore();
-        }
+        onLoadMore();
       }
     },
     [hasMore, isLoading, isLoadingMore, onLoadMore]

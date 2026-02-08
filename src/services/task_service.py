@@ -187,7 +187,8 @@ class TaskService:
                 code=code,
                 skip_analysis=False,
                 single_stock_notify=True,
-                report_type=report_type
+                report_type=report_type,
+                query_id=task_id
             )
 
             if result:

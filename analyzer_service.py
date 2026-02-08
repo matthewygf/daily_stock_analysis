@@ -63,7 +63,8 @@ def analyze_stock(
         code=stock_code,
         skip_analysis=False,
         single_stock_notify=notifier is not None,
-        report_type=report_type
+        report_type=report_type,
+        query_id=pipeline.query_id
     )
     
     return result

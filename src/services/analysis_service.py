@@ -82,7 +82,8 @@ class AnalysisService:
                 code=stock_code,
                 skip_analysis=False,
                 single_stock_notify=send_notification,
-                report_type=rt
+                report_type=rt,
+                query_id=query_id
             )
             
             if result is None:
