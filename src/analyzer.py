@@ -12,6 +12,7 @@ A股自选股智能分析系统 - AI分析层
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
@@ -79,6 +80,43 @@ STOCK_NAME_MAP = {
     '00883': '中国海洋石油',
 }
 
+# Expanded Risk Dictionary with Market Targeting
+TIME_RISK_EVENTS = {
+    # --- Global / US Impact (Affects almost everything) ---
+    "FED_DECISION": {
+        "keywords": ["美联储", "FED", "FOMC", "利率决议", "加息", "降息", "鲍威尔"],
+        "reason": "美联储关键政策窗口期，全球流动性预期剧烈波动",
+        "target_markets": ["US", "HK", "CRYPTO", "CN"] # Fed affects everyone, but less so CN internal plays
+    },
+    
+    # --- China Specific (A-Shares / HK Stocks) ---
+    "CN_POLICY": {
+        "keywords": ["人行", "央行", "降准", "LPR", "MLF", "逆回购", "两会", "十四五"],
+        "reason": "国内重大会议或监管政策发布，板块轮动风险大",
+        "target_markets": ["CN", "HK"]
+    },
+    
+    # --- US Specific (US Stocks) ---
+    "US_MACRO": {
+        "keywords": ["非农", "美国CPI", "美国PCE", "美股财报", "四巫日"],
+        "reason": "美股核心宏观数据或交割日，由于不设涨跌幅，波动极高",
+        "target_markets": ["US", "HK", "CRYPTO"]
+    },
+    
+    # --- Crypto Specific ---
+    "CRYPTO_EVENTS": {
+        "keywords": ["减半", "SEC监管", "ETF审批", "链上拥堵", "Gas费"],
+        "reason": "加密货币特有行业事件，存在极端波动风险",
+        "target_markets": ["CRYPTO"]
+    },
+    
+    # --- Earnings (General) ---
+    "EARNINGS": {
+        "keywords": ["财报", "业绩", "营收", "净利润", "指引"],
+        "reason": "个股财报日，存在隔夜跳空风险",
+        "target_markets": ["ALL"] # Earnings apply to the specific stock regardless of market
+    }
+}
 
 def get_stock_name_multi_source(
     stock_code: str,
@@ -331,41 +369,204 @@ class GeminiAnalyzer:
     # 核心模块：核心结论 + 数据透视 + 舆情情报 + 作战计划
     # ========================================
 
-    SYSTEM_PROMPT = """你是一位专注于趋势交易的 A 股投资分析师，负责生成专业的【决策仪表盘】分析报告。
+    SYSTEM_PROMPT = """ 你是一位**专注于趋势交易的专业投资分析师**，主要覆盖 **港股（HK）与美股（US）市场**。  
+你的任务是基于数据，生成**严格遵循规则、可执行、风险优先**的【决策仪表盘】分析报告。
 
-## 核心交易理念（必须严格遵守）
+你**不是预测市场情绪的评论员**，而是**为交易决策服务的执行型分析系统**。
+---
+## 零、数据完整性与一致性协议（新增 - 最高优先级）
 
-### 1. 严进策略（不追高）
-- **绝对不追高**：当股价偏离 MA5 超过 5% 时，坚决不买入
-- **乖离率公式**：(现价 - MA5) / MA5 × 100%
-- 乖离率 < 2%：最佳买点区间
-- 乖离率 2-5%：可小仓介入
-- 乖离率 > 5%：严禁追高！直接判定为"观望"
+1.  **严禁捏造数据（防幻觉协议）**：
+    * 对于 **资本开支 (CapEx)**、**营收**、**市值** 等具体金额，必须进行**数量级核查**。
+    * *示例*：若计算出某公司 CapEx 为 1.8 万亿（远超其历史水平或市值），必须标记为数据异常，**严禁写入错误数值**。
+    * 若数据缺失，请在对应字段填入 `null` 或 `-1`，并在文本中说明。
 
-### 2. 趋势交易（顺势而为）
-- **多头排列必须条件**：MA5 > MA10 > MA20
-- 只做多头排列的股票，空头排列坚决不碰
-- 均线发散上行优于均线粘合
-- 趋势强度判断：看均线间距是否在扩大
+2.  **文数一致性原则**：
+    * 你的 **文字分析** 必须与 **数据指标** 严格对齐。
+    * *示例*：若 `volume_analysis.volume_status` 为 "缩量"，则 `trend_analysis` 或 `one_sentence` 中**严禁**出现 "放量下跌" 的描述。
+    * **数据是事实，文字是翻译**，不得出现矛盾。
+---
+## 一、核心交易理念（必须严格遵守，不得擅自修改）
+### 1️⃣ 趋势过滤（方向优先）
 
-### 3. 效率优先（筹码结构）
-- 关注筹码集中度：90%集中度 < 15% 表示筹码集中
-- 获利比例分析：70-90% 获利盘时需警惕获利回吐
-- 平均成本与现价关系：现价高于平均成本 5-15% 为健康
+- **只在趋势成立时考虑交易**
+- 多头趋势的必要条件：
+  - **MA5 > MA10 > MA20**
+  - **MA20 向上运行**
+- 均线间距扩大优于均线粘合
+- 若 **MA5 < MA10**，视为趋势走弱，禁止新开仓
+- 若 **收盘价有效跌破 MA20**，视为趋势破坏，直接判定为【观望 / 卖出】
 
-### 4. 买点偏好（回踩支撑）
+> 趋势判断基于 **日线级别**
+
+---
+
+### 2️⃣ 严进策略（不追高，位置决定盈亏比）
+
+你必须严格控制买入位置，**绝不追高**。
+
+#### 乖离率定义（基于 MA5）：
+```
+乖离率 = (现价 - MA5) / MA5 × 100%
+```
+
+#### 不同市场的乖离率阈值：
+
+**港股（HK）**
+- < 3%：安全区（理想买点）
+- 3%–6%：警戒区（可小仓）
+- > 6%：禁止区（严禁追高）
+
+**美股（US）**
+- < 4%：安全区
+- 4%–8%：警戒区
+- > 8%：禁止区
+
+> 乖离率进入禁止区时，**无论趋势多强，直接判定为观望**
+
+---
+
+### 3️⃣ 买点偏好（回撤入场）
+
+你偏好在趋势中的**回撤结构**入场：
+
 - **最佳买点**：缩量回踩 MA5 获得支撑
 - **次优买点**：回踩 MA10 获得支撑
-- **观望情况**：跌破 MA20 时观望
+- **禁止买入**：
+  - 放量下跌
+  - 跌破 MA20
+  - 高位放量滞涨
 
-### 5. 风险排查重点
-- 减持公告（股东、高管减持）
-- 业绩预亏/大幅下滑
-- 监管处罚/立案调查
-- 行业政策利空
-- 大额解禁
+---
 
-## 输出格式：决策仪表盘 JSON
+### 4️⃣ 量能确认（趋势是否健康）
+
+- **缩量回调**：视为抛压减轻（加分）
+- **放量上涨**：趋势确认（加分）
+- **放量下跌**：
+  - 若跌幅 >3% 且量比 >1.5
+  - 直接触发【风险否决】
+
+---
+
+### 5️⃣ 结构与筹码（辅助判断）
+
+基于东方财富数据：
+
+- 获利盘 70%–85%：结构健康
+- 获利盘 >90%：警惕获利回吐
+- 筹码集中度 <15%：加分
+- 美股中，筹码指标仅作**辅助参考**，权重低于趋势与量价
+
+---
+
+### 6️⃣ 风险否决机制（最高优先级）
+
+以下任意一项出现，**直接否决所有买入信号**：
+
+- 股东 / 高管减持公告
+- 监管调查 / 处罚
+- 重大解禁
+- 财报暴雷或业绩大幅不及预期
+- 行业或政策级别利空
+- 放量下跌破位
+
+> **风险否决优先级高于所有技术评分**
+
+---
+
+### 7️⃣ 美股宏观与时间风险管理（必须遵守）
+
+你必须将**美股宏观事件与时间节点**视为**高优先级风险管理因素**，其优先级等同于公司级重大利空。
+
+#### 1. 美联储（FED）利率决议
+
+- 在美联储利率决议公布前：
+  - **公布日前 1 个交易日至公布前**：
+    - 禁止新开仓
+    - 已持仓者不建议加仓
+- 利率决议公布当日：
+  - 若结果与市场预期存在明显偏差：
+    - 必须降低 `confidence_level`
+    - 在 `risk_alerts` 中明确标注「利率决议不确定性风险」
+- 利率决议公布后：
+  - 至少等待 **1 个交易日** 再评估趋势有效性
+
+> 你不预测利率方向，只管理事件不确定性风险。
+
+---
+
+#### 2. 重要宏观数据（CPI / 非农 / 失业率）
+
+- 若重要宏观数据将在 **未来 3 个交易日内公布**：
+  - 禁止新开仓
+  - `time_sensitivity` 只能为「不急」
+- 数据公布当日：
+  - 若实际值与预测值显著偏离：
+    - 标记为「宏观波动风险」
+    - 降低 `confidence_level`
+    - 在 `risk_alerts` 中说明「实际值 vs 预测值偏差」
+
+> 你不解读宏观趋势，只评估短期波动风险。
+
+---
+
+#### 3. 个股财报发布时间（美股）
+
+- 若个股财报将在 **未来 5 个交易日内发布**：
+  - 禁止新开仓
+  - 已持仓者需明确提示「财报不确定性风险」
+- 财报发布当日：
+  - 不给出任何买入或加仓建议
+- 财报发布后：
+  - 至少等待 **1 个交易日**
+  - 再重新评估趋势结构与买点
+
+> 财报属于不可控跳空风险，不纳入趋势交易入场条件。
+
+---
+
+## 二、评分体系（用于决策强度，不可替代否决项）
+
+- 趋势结构：40 分
+- 价格位置（乖离率）：25 分
+- 量能配合：15 分
+- 筹码结构：10 分
+- 消息 / 情绪：10 分
+
+### 决策分级：
+
+- **80–100 分**：强烈买入
+- **60–79 分**：买入
+- **40–59 分**：观望
+- **0–39 分**：卖出 / 减仓
+
+---
+
+## 三、输出要求（必须遵守）
+
+你必须输出一个完整的【决策仪表盘】，并遵循以下原则：
+
+1. **核心结论先行**：一句话直接告诉用户该做什么  
+2. **区分空仓 / 持仓建议**  
+3. **给出明确入场、止损、止盈逻辑**  
+4. **使用 ✅ ⚠️ ❌ 检查清单**  
+5. **风险项必须醒目标出**  
+6. 不得给出模糊、情绪化或预测性语言  
+
+### 额外一致性约束（必须遵守）：
+
+- `operation_advice`、`decision_type`、`signal_type` 三者必须逻辑一致  
+- 若触发风险否决机制：
+  - 禁止输出任何买入或加仓建议  
+  - `signal_type` 只能为 ⚠️风险警告 或 🔴卖出信号  
+- 若数据不足以支持精确价格：
+  - 允许使用 MA 附近区间表达  
+  - 必须降低 `confidence_level` 并在 `risk_warning` 中说明原因  
+
+---
+
+## 四、输出格式（严格 JSON，不得增删字段）
 
 请严格按照以下 JSON 格式输出，这是一个完整的【决策仪表盘】：
 
@@ -472,40 +673,28 @@ class GeminiAnalyzer:
     "data_sources": "数据来源说明"
 }
 ```
+---
 
-## 评分标准
+## 五、行为约束（非常重要）
 
-### 强烈买入（80-100分）：
-- ✅ 多头排列：MA5 > MA10 > MA20
-- ✅ 低乖离率：<2%，最佳买点
-- ✅ 缩量回调或放量突破
-- ✅ 筹码集中健康
-- ✅ 消息面有利好催化
+- 你是**交易决策系统**，不是荐股营销号
+- 数据真实性约束：在输出基本面数据（如资本开支 CapEx、营收）前，进行常识性检查。若数值异常巨大（如 1.8万亿美金 CapEx），请再次核对单位或数据源，若无法确认则不输出。
+- 致性约束：确保analysis_summary中的定性描述（如"缩量"）与volume_analysis中的定量数据（如volume_ratio < 1）完全一致。
+- 不使用夸张、煽动性语言
+- 不预测“必涨”“翻倍”
+- 不在数据不足时强行给出具体价格
+- 若数据质量不足，必须降低置信度并说明原因
+- 不得在 JSON 外输出任何解释性文字  
 
-### 买入（60-79分）：
-- ✅ 多头排列或弱势多头
-- ✅ 乖离率 <5%
-- ✅ 量能正常
-- ⚪ 允许一项次要条件不满足
+---
 
-### 观望（40-59分）：
-- ⚠️ 乖离率 >5%（追高风险）
-- ⚠️ 均线缠绕趋势不明
-- ⚠️ 有风险事件
+## 六、你的最终目标
 
-### 卖出/减仓（0-39分）：
-- ❌ 空头排列
-- ❌ 跌破MA20
-- ❌ 放量下跌
-- ❌ 重大利空
+你的目标不是“看起来很专业”，  
+而是：
 
-## 决策仪表盘核心原则
-
-1. **核心结论先行**：一句话说清该买该卖
-2. **分持仓建议**：空仓者和持仓者给不同建议
-3. **精确狙击点**：必须给出具体价格，不说模糊的话
-4. **检查清单可视化**：用 ✅⚠️❌ 明确显示每项检查结果
-5. **风险优先级**：舆情中的风险点要醒目标出"""
+> **在长期重复执行中，帮助用户避免追高、避免踩雷、只在高胜率区间出手。**
+"""
 
     def __init__(self, api_key: Optional[str] = None):
         """
@@ -518,7 +707,7 @@ class GeminiAnalyzer:
         """
         config = get_config()
         self._api_key = api_key or config.gemini_api_key
-        self._model = None
+        self._client = None
         self._current_model_name = None  # 当前使用的模型名称
         self._using_fallback = False  # 是否正在使用备选模型
         self._use_openai = False  # 是否使用 OpenAI 兼容 API
@@ -540,7 +729,7 @@ class GeminiAnalyzer:
             self._init_openai_fallback()
 
         # 两者都未配置
-        if not self._model and not self._openai_client:
+        if not self._client and not self._openai_client:
             logger.warning("未配置任何 AI API Key，AI 分析功能将不可用")
 
     def _init_openai_fallback(self) -> None:
@@ -601,46 +790,25 @@ class GeminiAnalyzer:
         初始化 Gemini 模型
 
         配置：
-        - 使用 gemini-3-flash-preview 或 gemini-2.5-flash 模型
+        - 使用 gemini-3-flash-preview 或 gemini-2.0-flash 或 gemini-1.5-flash 模型
         - 不启用 Google Search（使用外部 Tavily/SerpAPI 搜索）
         """
         try:
-            import google.generativeai as genai
-
-            # 配置 API Key
-            genai.configure(api_key=self._api_key)
+            from google import genai
 
             # 从配置获取模型名称
             config = get_config()
             model_name = config.gemini_model
-            fallback_model = config.gemini_model_fallback
 
-            # 不再使用 Google Search Grounding（已知有兼容性问题）
-            # 改为使用外部搜索服务（Tavily/SerpAPI）预先获取新闻
-
-            # 尝试初始化主模型
-            try:
-                self._model = genai.GenerativeModel(
-                    model_name=model_name,
-                    system_instruction=self.SYSTEM_PROMPT,
-                )
-                self._current_model_name = model_name
-                self._using_fallback = False
-                logger.info(f"Gemini 模型初始化成功 (模型: {model_name})")
-            except Exception as model_error:
-                # 尝试备选模型
-                logger.warning(f"主模型 {model_name} 初始化失败: {model_error}，尝试备选模型 {fallback_model}")
-                self._model = genai.GenerativeModel(
-                    model_name=fallback_model,
-                    system_instruction=self.SYSTEM_PROMPT,
-                )
-                self._current_model_name = fallback_model
-                self._using_fallback = True
-                logger.info(f"Gemini 备选模型初始化成功 (模型: {fallback_model})")
+            # 初始化 Client
+            self._client = genai.Client(api_key=self._api_key)
+            self._current_model_name = model_name
+            self._using_fallback = False
+            logger.info(f"Gemini API 初始化成功 (默认模型: {model_name})")
 
         except Exception as e:
             logger.error(f"Gemini 模型初始化失败: {e}")
-            self._model = None
+            self._client = None
 
     def _switch_to_fallback_model(self) -> bool:
         """
@@ -650,18 +818,14 @@ class GeminiAnalyzer:
             是否成功切换
         """
         try:
-            import google.generativeai as genai
             config = get_config()
             fallback_model = config.gemini_model_fallback
 
             logger.warning(f"[LLM] 切换到备选模型: {fallback_model}")
-            self._model = genai.GenerativeModel(
-                model_name=fallback_model,
-                system_instruction=self.SYSTEM_PROMPT,
-            )
+            # google-genai 不需要重新创建 client，只需在请求时更改模型名称即可
             self._current_model_name = fallback_model
             self._using_fallback = True
-            logger.info(f"[LLM] 备选模型 {fallback_model} 初始化成功")
+            logger.info(f"[LLM] 备选模型 {fallback_model} 切换成功")
             return True
         except Exception as e:
             logger.error(f"[LLM] 切换备选模型失败: {e}")
@@ -669,7 +833,7 @@ class GeminiAnalyzer:
 
     def is_available(self) -> bool:
         """检查分析器是否可用"""
-        return self._model is not None or self._openai_client is not None
+        return self._client is not None or self._openai_client is not None
 
     def _call_openai_api(self, prompt: str, generation_config: dict) -> str:
         """
@@ -778,6 +942,7 @@ class GeminiAnalyzer:
         if self._use_openai:
             return self._call_openai_api(prompt, generation_config)
         
+        from google.genai import types
         config = get_config()
         max_retries = config.gemini_max_retries
         base_delay = config.gemini_retry_delay
@@ -794,10 +959,15 @@ class GeminiAnalyzer:
                     logger.info(f"[Gemini] 第 {attempt + 1} 次重试，等待 {delay:.1f} 秒...")
                     time.sleep(delay)
                 
-                response = self._model.generate_content(
-                    prompt,
-                    generation_config=generation_config,
-                    request_options={"timeout": 120}
+                # 使用 google-genai SDK 调用
+                response = self._client.models.generate_content(
+                    model=self._current_model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=self.SYSTEM_PROMPT,
+                        temperature=generation_config.get('temperature'),
+                        max_output_tokens=generation_config.get('max_output_tokens'),
+                    )
                 )
                 
                 if response and response.text:
@@ -908,11 +1078,7 @@ class GeminiAnalyzer:
             prompt = self._format_prompt(context, name, news_context)
             
             # 获取模型名称
-            model_name = getattr(self, '_current_model_name', None)
-            if not model_name:
-                model_name = getattr(self._model, '_model_name', 'unknown')
-                if hasattr(self._model, 'model_name'):
-                    model_name = self._model.model_name
+            model_name = getattr(self, '_current_model_name', 'unknown')
             
             logger.info(f"========== AI 分析 {name}({code}) ==========")
             logger.info(f"[LLM配置] 模型: {model_name}")
@@ -1245,105 +1411,317 @@ class GeminiAnalyzer:
             })
 
         return snapshot
+    
+    def identify_market(self, code: str) -> str:
+        """
+        Identifies market type based on stock code format.
+        Returns: 'CN', 'US', 'HK', 'CRYPTO', or 'UNKNOWN'
+        """
+        code = code.upper().strip()
+        
+        # 1. Crypto: Often contains USDT, BUSD, USD or is BTC/ETH
+        if 'USDT' in code or 'BUSD' in code or code in ['BTC', 'ETH']:
+            return 'CRYPTO'
+            
+        # 2. China A-Shares (CN)
+        # Common formats: 60xxxx, 00xxxx, 30xxxx (6 digits)
+        # Or suffix: .SS (Shanghai), .SZ (Shenzhen)
+        if code.endswith(('.SS', '.SZ')):
+            return 'CN'
+        if re.match(r'^(60|00|30|68)\d{4}$', code):
+            return 'CN'
+            
+        # 3. Hong Kong (HK)
+        # Common formats: 00700, 09988 (5 digits), sometimes suffix .HK
+        if code.endswith('.HK'):
+            return 'HK'
+        if re.match(r'^\d{5}$', code):
+            return 'HK'
+            
+        # 4. US Stocks
+        # Usually just letters (AAPL, TSLA) or suffix .US
+        # Sometimes containing dots (BRK.B)
+        if code.endswith('.US'):
+            return 'US'
+        if re.match(r'^[A-Z\.]+$', code): # Pure letters
+            return 'US'
+            
+        # Default
+        return 'UNKNOWN'
 
     def _parse_response(
         self, 
         response_text: str, 
         code: str, 
         name: str
-    ) -> AnalysisResult:
-        """
-        解析 Gemini 响应（决策仪表盘版）
-        
-        尝试从响应中提取 JSON 格式的分析结果，包含 dashboard 字段
-        如果解析失败，尝试智能提取或返回默认结果
-        """
-        try:
-            # 清理响应文本：移除 markdown 代码块标记
-            cleaned_text = response_text
-            if '```json' in cleaned_text:
-                cleaned_text = cleaned_text.replace('```json', '').replace('```', '')
-            elif '```' in cleaned_text:
-                cleaned_text = cleaned_text.replace('```', '')
+        ) -> AnalysisResult:
+            """
+            解析 Gemini 响应（决策仪表盘版） - 完整修复版
             
-            # 尝试找到 JSON 内容
-            json_start = cleaned_text.find('{')
-            json_end = cleaned_text.rfind('}') + 1
-            
-            if json_start >= 0 and json_end > json_start:
-                json_str = cleaned_text[json_start:json_end]
-                
-                # 尝试修复常见的 JSON 问题
-                json_str = self._fix_json_string(json_str)
-                
-                data = json.loads(json_str)
-                
-                # 提取 dashboard 数据
-                dashboard = data.get('dashboard', None)
+            改进点：
+            1. 修复了逻辑覆盖 Bug：风控拦截现在拥有最高优先级。
+            2. 增强了 JSON 解析的鲁棒性：防止 int() 转换失败或字典键缺失导致崩溃。
+            3. 语义修正：使用 "离场回避" 代替单纯的 "清仓"，适应不同持仓状态。
+            4. UI 兜底：强制修复 Dashboard 显示，确保风险提示一定会被用户看到。
+            """
+            try:
+                # =================================================
+                # 1. 文本清理与 JSON 提取
+                # =================================================
 
-                # 优先使用 AI 返回的股票名称（如果原名称无效或包含代码）
-                ai_stock_name = data.get('stock_name')
-                if ai_stock_name and (name.startswith('股票') or name == code or 'Unknown' in name):
-                    name = ai_stock_name
+                cleaned_text = response_text
+                if '```json' in cleaned_text:
+                    cleaned_text = cleaned_text.replace('```json', '').replace('```', '')
+                elif '```' in cleaned_text:
+                    cleaned_text = cleaned_text.replace('```', '')
+                
+                # 尝试找到 JSON 内容
+                json_start = cleaned_text.find('{')
+                json_end = cleaned_text.rfind('}') + 1
+                
+                if json_start >= 0 and json_end > json_start:
+                    json_str = cleaned_text[json_start:json_end]
+                    # 尝试修复常见的 JSON 格式错误
+                    json_str = self._fix_json_string(json_str)
+                    data = json.loads(json_str)
 
-                # 解析所有字段，使用默认值防止缺失
-                # 解析 decision_type，如果没有则根据 operation_advice 推断
-                decision_type = data.get('decision_type', '')
-                if not decision_type:
-                    op = data.get('operation_advice', '持有')
-                    if op in ['买入', '加仓', '强烈买入']:
-                        decision_type = 'buy'
-                    elif op in ['卖出', '减仓', '强烈卖出']:
-                        decision_type = 'sell'
+                    # =================================================
+                    # 2. 核心数据安全提取 (Safe Extraction)
+                    # =================================================
+
+                    # --- 提取情绪分 (带类型安全转换) ---
+                    try:
+                        sentiment_score = int(float(data.get('sentiment_score', 50)))
+                    except (ValueError, TypeError):
+                        sentiment_score = 50
+
+                    # --- 提取 Dashboard 及子模块 ---
+                    dashboard = data.get('dashboard', {})
+                    if not isinstance(dashboard, dict): dashboard = {}
+                    
+                    data_perspective = dashboard.get('data_perspective', {})
+                    if not isinstance(data_perspective, dict): data_perspective = {}
+
+                    intelligence = dashboard.get('intelligence', {})
+                    if not isinstance(intelligence, dict): intelligence = {}
+
+                    # =================================================
+                    # 3. 交易权限门槛计算 (Trade Permission Gates)
+                    # =================================================
+
+                    # 🛑 门槛 A: 趋势硬止损 (Trend Hard Stop)
+                    trend_status = data_perspective.get('trend_status', {})
+                    try:
+                        trend_score = int(float(trend_status.get('trend_score', 50)))
+                    except (ValueError, TypeError):
+                        trend_score = 50
+                    
+                    # 定义：趋势破坏 = 分数低于 40
+                    trend_broken = trend_score < 40
+
+                    # 🚧 门槛 B: 环境过滤器 (Context Filters)
+                    # 1. 情绪过滤器
+                    sentiment_ok = sentiment_score >= 60
+
+                    # 2. 乖离率过滤器
+                    price_position = data_perspective.get('price_position', {})
+                    bias_status = price_position.get('bias_status', '')
+                    bias_ok = bias_status not in ['危险', '禁止']
+
+                    # 3. 时间风险过滤器
+                    risk_alerts = intelligence.get('risk_alerts', [])
+                    if not isinstance(risk_alerts, list): risk_alerts = []
+                    
+                    risk_warning_text = data.get('risk_warning', '')
+
+                    current_market = self.identify_market(code) # e.g., 'US' or 'CN'
+
+                    time_risk_reasons = []
+                    
+                    # 拼接所有风险文本进行关键词检索
+                    risk_text_pool = str(risk_warning_text) + " " + " ".join([str(x) for x in risk_alerts])
+
+                    # 检查全局变量是否存在，防止报错
+                    for event_key, event_data in TIME_RISK_EVENTS.items():
+                    
+                        # --- CHECK: Is this risk relevant to my market? ---
+                        target_markets = event_data.get("target_markets", ["ALL"])
+                        
+                        is_relevant = (
+                            "ALL" in target_markets or 
+                            current_market == 'UNKNOWN' or 
+                            current_market in target_markets
+                        )
+                        
+                        if not is_relevant:
+                            continue # Skip unrelated risks (e.g. don't check LPR for Apple)
+
+                        # --- CHECK: Do keywords exist? ---
+                        # We use 'keywords' from the dictionary to scan the AI's text
+                        if any(kw in risk_text_pool for kw in event_data["keywords"]):
+                            # Formatting the reason to be specific
+                            prefix = f"[{current_market} Market Risk]" if current_market != 'UNKNOWN' else ""
+                            time_risk_reasons.append(f"{prefix} {event_data['reason']}")
+                    
+                    # =================================================
+                    # 4. 决策逻辑分层 (Decision Hierarchy)
+                    # 优先级：趋势破坏(卖) > 环境风险(观望) > AI原始建议
+                    # =================================================
+                    
+                    final_decision_type = ''
+                    final_operation_advice = ''
+                    final_confidence = ''
+                    block_reasons = []
+                    ALLOW_TRADE = True # 默认为真，下面逐步证伪
+
+                    # 收集阻断原因
+                    if not sentiment_ok:
+                        block_reasons.append(f"市场情绪偏弱({sentiment_score})")
+                    if not bias_ok:
+                        block_reasons.append(f"乖离率处于{bias_status}区")
+                    if time_risk_reasons:
+                        block_reasons.extend(time_risk_reasons)
+
+                    # --- 核心判定路径 ---
+                    
+                    if trend_broken:
+                        # 🔴 路径 1: 趋势已坏 -> 强制卖出/回避
+                        final_operation_advice = '卖出'
+                        final_decision_type = 'sell'
+                        final_confidence = '高'
+                        # 插入最关键的原因到列表头部
+                        block_reasons.insert(0, f"趋势结构破坏(评分{trend_score})")
+                        ALLOW_TRADE = False 
+
+                    elif block_reasons:
+                        # 🟡 路径 2: 趋势尚可，但环境有风险 -> 强制观望/禁止买入
+                        ai_advice = data.get('operation_advice', '持有')
+                        
+                        # 特殊情况：如果 AI 本身就建议卖出，我们尊重卖出建议
+                        if ai_advice in ['卖出', '减仓', '强烈卖出']:
+                            final_operation_advice = ai_advice
+                            final_decision_type = 'sell'
+                            final_confidence = data.get('confidence_level', '高')
+                        else:
+                            # 如果 AI 想买入或持有，由于环境风险，强制转为观望
+                            final_operation_advice = '观望'
+                            final_decision_type = 'hold'
+                            final_confidence = '低'
+                        
+                        ALLOW_TRADE = False
+
                     else:
-                        decision_type = 'hold'
-                
-                return AnalysisResult(
-                    code=code,
-                    name=name,
-                    # 核心指标
-                    sentiment_score=int(data.get('sentiment_score', 50)),
-                    trend_prediction=data.get('trend_prediction', '震荡'),
-                    operation_advice=data.get('operation_advice', '持有'),
-                    decision_type=decision_type,
-                    confidence_level=data.get('confidence_level', '中'),
-                    # 决策仪表盘
-                    dashboard=dashboard,
-                    # 走势分析
-                    trend_analysis=data.get('trend_analysis', ''),
-                    short_term_outlook=data.get('short_term_outlook', ''),
-                    medium_term_outlook=data.get('medium_term_outlook', ''),
-                    # 技术面
-                    technical_analysis=data.get('technical_analysis', ''),
-                    ma_analysis=data.get('ma_analysis', ''),
-                    volume_analysis=data.get('volume_analysis', ''),
-                    pattern_analysis=data.get('pattern_analysis', ''),
-                    # 基本面
-                    fundamental_analysis=data.get('fundamental_analysis', ''),
-                    sector_position=data.get('sector_position', ''),
-                    company_highlights=data.get('company_highlights', ''),
-                    # 情绪面/消息面
-                    news_summary=data.get('news_summary', ''),
-                    market_sentiment=data.get('market_sentiment', ''),
-                    hot_topics=data.get('hot_topics', ''),
-                    # 综合
-                    analysis_summary=data.get('analysis_summary', '分析完成'),
-                    key_points=data.get('key_points', ''),
-                    risk_warning=data.get('risk_warning', ''),
-                    buy_reason=data.get('buy_reason', ''),
-                    # 元数据
-                    search_performed=data.get('search_performed', False),
-                    data_sources=data.get('data_sources', '技术面数据'),
-                    success=True,
-                )
-            else:
-                # 没有找到 JSON，尝试从纯文本中提取信息
-                logger.warning(f"无法从响应中提取 JSON，使用原始文本分析")
+                        # 🟢 路径 3: 一切正常 -> 完全采纳 AI 建议
+                        final_operation_advice = data.get('operation_advice', '持有')
+                        final_decision_type = data.get('decision_type', '') 
+                        final_confidence = data.get('confidence_level', '中')
+                        ALLOW_TRADE = True
+
+                    # --- 补全 decision_type (如果 AI 漏了) ---
+                    if not final_decision_type:
+                        if final_operation_advice in ['买入', '加仓', '强烈买入']:
+                            final_decision_type = 'buy'
+                        elif final_operation_advice in ['卖出', '减仓', '强烈卖出']:
+                            final_decision_type = 'sell'
+                        else:
+                            final_decision_type = 'hold'
+
+                    # =================================================
+                    # 5. 数据修正与回写 (Data Correction & Write-back)
+                    # =================================================
+
+                    # 1. 修正股票名称 (优先使用 AI 识别的准确名称)
+                    ai_stock_name = data.get('stock_name')
+                    if ai_stock_name and (name.startswith('股票') or name == code or 'Unknown' in name):
+                        name = ai_stock_name
+
+                    # 2. 修正 Dashboard 核心结论 (确保风险被看见)
+                    # 如果 Dashboard 存在，我们需要确保 core_conclusion 反映了我们的强制风控逻辑
+                    if dashboard:
+                        # 确保 core_conclusion 字典存在
+                        if 'core_conclusion' not in dashboard or not isinstance(dashboard['core_conclusion'], dict):
+                            dashboard['core_conclusion'] = {
+                                'signal_type': '⚪分析中',
+                                'one_sentence': '数据正在整合...',
+                                'confidence_score': 50
+                            }
+                        
+                        core = dashboard['core_conclusion']
+
+                        # --- 场景 A: 触发“趋势破坏” (硬止损) ---
+                        if trend_broken:
+                            core['signal_type'] = '🔴离场回避'  # 使用中性偏空的词汇，适用所有人群
+                            core['one_sentence'] = f"趋势评分过低 ({trend_score}分)，多头结构已破坏，建议立即离场或停止买入。"
+                            core['time_sensitivity'] = '紧急'
+                            core['block_reason'] = f"趋势硬止损触发 (评分 {trend_score} < 40)"
+                            # 强制更新 dashboard 中的建议
+                            core['suggestion'] = '卖出/回避'
+                        
+                        # --- 场景 B: 触发“环境风控” (软过滤) ---
+                        elif not ALLOW_TRADE and final_decision_type != 'sell':
+                            core['signal_type'] = '🟡暂缓介入'
+                            # 保留 AI 原话，但加上前缀警告
+                            orig_sentence = core.get('one_sentence', '')
+                            core['one_sentence'] = f"【环境风险】当前胜率不高，建议观望。({orig_sentence})"
+                            core['time_sensitivity'] = '不急'
+                            core['block_reason'] = "; ".join(block_reasons)
+
+                    # 3. 生成最终的 Risk Warning 文本
+                    full_risk_warning = data.get('risk_warning', '')
+                    if block_reasons:
+                        # 将风控拦截原因加到最前面
+                        full_risk_warning = f"【风控拦截】{'; '.join(block_reasons)} | " + full_risk_warning
+
+                    # =================================================
+                    # 6. 返回结果对象
+                    # =================================================
+                    return AnalysisResult(
+                        code=code,
+                        name=name,
+                        # 核心指标 (使用计算后的最终值)
+                        sentiment_score=sentiment_score,
+                        trend_prediction=data.get('trend_prediction', '震荡'),
+                        operation_advice=final_operation_advice,
+                        decision_type=final_decision_type,
+                        confidence_level=final_confidence,
+                        # 决策仪表盘
+                        dashboard=dashboard,
+                        # 原始分析数据透传
+                        trend_analysis=data.get('trend_analysis', ''),
+                        short_term_outlook=data.get('short_term_outlook', ''),
+                        medium_term_outlook=data.get('medium_term_outlook', ''),
+                        technical_analysis=data.get('technical_analysis', ''),
+                        ma_analysis=data.get('ma_analysis', ''),
+                        volume_analysis=data.get('volume_analysis', ''),
+                        pattern_analysis=data.get('pattern_analysis', ''),
+                        fundamental_analysis=data.get('fundamental_analysis', ''),
+                        sector_position=data.get('sector_position', ''),
+                        company_highlights=data.get('company_highlights', ''),
+                        news_summary=data.get('news_summary', ''),
+                        market_sentiment=data.get('market_sentiment', ''),
+                        hot_topics=data.get('hot_topics', ''),
+                        # 综合
+                        analysis_summary=data.get('analysis_summary', '分析完成'),
+                        key_points=data.get('key_points', ''),
+                        risk_warning=full_risk_warning,
+                        buy_reason=data.get('buy_reason', ''),
+                        # 元数据
+                        search_performed=data.get('search_performed', False),
+                        data_sources=data.get('data_sources', '技术面数据'),
+                        success=True,
+                    )
+                else:
+                    # 没找到 JSON
+                    logger.warning(f"无法从响应中提取 JSON，使用原始文本分析")
+                    return self._parse_text_response(response_text, code, name)
+                    
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON 解析失败: {e}，尝试从文本提取")
                 return self._parse_text_response(response_text, code, name)
-                
-        except json.JSONDecodeError as e:
-            logger.warning(f"JSON 解析失败: {e}，尝试从文本提取")
-            return self._parse_text_response(response_text, code, name)
+            except Exception as e:
+                logger.error(f"解析过程发生未知错误: {e}")
+                # 发生未知错误时兜底
+                return self._parse_text_response(response_text, code, name)
     
     def _fix_json_string(self, json_str: str) -> str:
         """修复常见的 JSON 格式问题"""
