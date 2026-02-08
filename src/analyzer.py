@@ -83,12 +83,26 @@ STOCK_NAME_MAP = {
 # Expanded Risk Dictionary with Market Targeting
 TIME_RISK_EVENTS = {
     # --- Global / US Impact (Affects almost everything) ---
-    "FED_DECISION": {
-        "keywords": ["美联储", "FED", "FOMC", "利率决议", "加息", "降息", "鲍威尔"],
-        "reason": "美联储关键政策窗口期，全球流动性预期剧烈波动",
-        "target_markets": ["US", "HK", "CRYPTO", "CN"] # Fed affects everyone, but less so CN internal plays
+    "EARNINGS": {
+        "keywords": [
+            "财报发布", "发布财报", "公布财报", "披露财报", # Action: Publishing
+            "业绩暴雷", "业绩不及", "指引下调",             # Action: Bad news
+            "即将财报", "临近财报",                         # Action: Timing
+            "Earnings Release", "Report Earnings"
+        ],
+        "reason": "个股临近财报发布或业绩暴雷，存在隔夜跳空风险",
+        "target_markets": ["ALL"]
     },
-    
+
+    # Optimized Fed Keywords
+    "FED_DECISION": {
+        "keywords": [
+            "利率决议", "议息会议", "即将加息", "即将降息",
+            "FOMC Meeting", "Fed Decision"
+        ],
+        "reason": "临近美联储利率决议，流动性预期波动极大",
+        "target_markets": ["US", "HK", "CRYPTO"]
+    },
     # --- China Specific (A-Shares / HK Stocks) ---
     "CN_POLICY": {
         "keywords": ["人行", "央行", "降准", "LPR", "MLF", "逆回购", "两会", "十四五"],
@@ -109,13 +123,6 @@ TIME_RISK_EVENTS = {
         "reason": "加密货币特有行业事件，存在极端波动风险",
         "target_markets": ["CRYPTO"]
     },
-    
-    # --- Earnings (General) ---
-    "EARNINGS": {
-        "keywords": ["财报", "业绩", "营收", "净利润", "指引"],
-        "reason": "个股财报日，存在隔夜跳空风险",
-        "target_markets": ["ALL"] # Earnings apply to the specific stock regardless of market
-    }
 }
 
 def get_stock_name_multi_source(
@@ -694,6 +701,28 @@ class GeminiAnalyzer:
 而是：
 
 > **在长期重复执行中，帮助用户避免追高、避免踩雷、只在高胜率区间出手。**
+
+---
+## 七、风险字段输出清洗协议 (Anti-False-Positive Protocol) 【至关重要】
+
+你的 `risk_alerts` 字段会被自动化脚本读取关键词。为了防止系统误判，你必须严格遵守：
+
+1. **仅输出“当前生效”或“即将发生”的风险**：
+   - 只有当事件处于 **“禁止交易窗口期”** 内时，才允许将其写入 `risk_alerts`。
+   - **禁止**在 `risk_alerts` 中描述“风险已过”或“距离风险尚早”的内容。
+
+2. **财报与宏观事件的特殊处理**：
+   - **错误写法**（会导致系统误判拦截）：
+     `"risk_alerts": ["距离财报发布还有2个月，目前安全"]` 
+     *(系统检测到关键词“财报”，会错误地拦截交易)*
+   
+   - **正确写法**（转移到利好或消息字段）：
+     `"risk_alerts": []` 
+     `"positive_catalysts": ["当前处于财报真空期，业绩雷风险低"]`
+
+3. **关键词隔离原则**：
+   - 如果某个风险不构成当前的阻碍，**绝对不要**在 `risk_alerts` 数组中提及该风险的专用名词（如：财报、美联储、CPI）。
+---
 """
 
     def __init__(self, api_key: Optional[str] = None):
