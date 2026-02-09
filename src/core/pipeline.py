@@ -399,6 +399,12 @@ class StockAnalysisPipeline:
                 'signal_score': trend_result.signal_score,
                 'signal_reasons': trend_result.signal_reasons,
                 'risk_factors': trend_result.risk_factors,
+                'adx': trend_result.adx,
+                'adx_status': trend_result.adx_status,
+                'atr': trend_result.atr,
+                'atr_percent': trend_result.atr_percent,
+                'candlestick_pattern': trend_result.candlestick_pattern,
+                'candlestick_signal': trend_result.candlestick_signal,
             }
         
         return enhanced

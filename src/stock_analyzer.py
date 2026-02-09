@@ -124,6 +124,18 @@ class TrendAnalysisResult:
     rsi_status: RSIStatus = RSIStatus.NEUTRAL
     rsi_signal: str = ""              # RSI 信号描述
 
+    # 新增技术指标 (ADX, ATR)
+    adx: float = 0.0               # 平均趋向指数
+    adx_status: str = ""           # ADX 状态描述
+    atr: float = 0.0               # 平均真实波幅
+    atr_percent: float = 0.0       # ATR 占比 (ATR/Price * 100)
+
+    # K线形态 (仅关注 MA10/MA20 支撑位的特定形态)
+    candlestick_pattern: str = ""  # 检测到的形态名称
+    candlestick_signal: str = ""   # 形态分析结果
+
+    stop_loss_price: float = 0.0  # 止损价
+
     # 买入信号
     buy_signal: BuySignal = BuySignal.WAIT
     signal_score: int = 0            # 综合评分 0-100
@@ -163,6 +175,12 @@ class TrendAnalysisResult:
             'rsi_24': self.rsi_24,
             'rsi_status': self.rsi_status.value,
             'rsi_signal': self.rsi_signal,
+            'adx': self.adx,
+            'adx_status': self.adx_status,
+            'atr': self.atr,
+            'atr_percent': self.atr_percent,
+            'candlestick_pattern': self.candlestick_pattern,
+            'candlestick_signal': self.candlestick_signal,
         }
 
 
@@ -197,6 +215,13 @@ class StockTrendAnalyzer:
     RSI_OVERBOUGHT = 70        # 超买阈值
     RSI_OVERSOLD = 30          # 超卖阈值
     
+    # ADX 参数
+    ADX_PERIOD = 14
+    ADX_THRESHOLD = 25         # 趋势强度阈值
+
+    # ATR 参数
+    ATR_PERIOD = 14
+    
     def __init__(self):
         """初始化分析器"""
         pass
@@ -214,11 +239,12 @@ class StockTrendAnalyzer:
         """
         result = TrendAnalysisResult(code=code)
         
-        if df is None or df.empty or len(df) < 20:
-            logger.warning(f"{code} 数据不足，无法进行趋势分析")
-            result.risk_factors.append("数据不足，无法完成分析")
+        # To this (ensure enough data for MA60 and smooth ADX):
+        if df is None or df.empty or len(df) < 60:
+            logger.warning(f"{code} 数据不足 (需要至少60根K线)，无法进行趋势分析")
+            result.risk_factors.append("数据不足")
             return result
-        
+
         # 确保数据按日期排序
         df = df.sort_values('date').reset_index(drop=True)
         
@@ -228,6 +254,10 @@ class StockTrendAnalyzer:
         # 计算 MACD 和 RSI
         df = self._calculate_macd(df)
         df = self._calculate_rsi(df)
+        
+        # 计算 ADX 和 ATR
+        df = self._calculate_adx(df)
+        df = self._calculate_atr(df)
 
         # 获取最新数据
         latest = df.iloc[-1]
@@ -255,7 +285,13 @@ class StockTrendAnalyzer:
         # 6. RSI 分析
         self._analyze_rsi(df, result)
 
-        # 7. 生成买入信号
+        # 7. ADX / ATR 分析
+        self._analyze_adx_atr(df, result)
+
+        # 8. K线形态分析
+        self._analyze_candlestick_patterns(df, result)
+
+        # 9. 生成买入信号
         self._generate_signal(result)
 
         return result
@@ -301,38 +337,72 @@ class StockTrendAnalyzer:
         return df
 
     def _calculate_rsi(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        计算 RSI 指标
-
-        公式：
-        - RS = 平均上涨幅度 / 平均下跌幅度
-        - RSI = 100 - (100 / (1 + RS))
-        """
+        """计算标准 RSI (使用 Wilder's Smoothing)"""
         df = df.copy()
-
+        
+        # 计算价格变化
+        delta = df['close'].diff()
+        
+        # 分离上涨和下跌
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        
         for period in [self.RSI_SHORT, self.RSI_MID, self.RSI_LONG]:
-            # 计算价格变化
-            delta = df['close'].diff()
-
-            # 分离上涨和下跌
-            gain = delta.where(delta > 0, 0)
-            loss = -delta.where(delta < 0, 0)
-
-            # 计算平均涨跌幅
-            avg_gain = gain.rolling(window=period).mean()
-            avg_loss = loss.rolling(window=period).mean()
-
-            # 计算 RS 和 RSI
+            # 使用 Wilder's Smoothing (alpha=1/period)
+            avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+            avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+            
             rs = avg_gain / avg_loss
             rsi = 100 - (100 / (1 + rs))
+            
+            df[f'RSI_{period}'] = rsi.fillna(50)
+            
+        return df
+    
+    def _calculate_adx(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        计算 ADX (Average Directional movement Index)
+        """
+        df = df.copy()
+        
+        # 计算 TR
+        df['H-L'] = df['high'] - df['low']
+        df['H-PC'] = abs(df['high'] - df['close'].shift(1))
+        df['L-PC'] = abs(df['low'] - df['close'].shift(1))
+        df['TR'] = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
+        
+        # 计算 DM
+        df['UpMove'] = df['high'] - df['high'].shift(1)
+        df['DownMove'] = df['low'].shift(1) - df['low']
+        
+        df['+DM'] = np.where((df['UpMove'] > df['DownMove']) & (df['UpMove'] > 0), df['UpMove'], 0)
+        df['-DM'] = np.where((df['DownMove'] > df['UpMove']) & (df['DownMove'] > 0), df['DownMove'], 0)
+        
+        # 平滑处理
+        alpha = 1 / self.ADX_PERIOD
+        df['TR14'] = df['TR'].ewm(alpha=alpha, adjust=False).mean()
+        df['+DI14'] = 100 * (df['+DM'].ewm(alpha=alpha, adjust=False).mean() / df['TR14'])
+        df['-DI14'] = 100 * (df['-DM'].ewm(alpha=alpha, adjust=False).mean() / df['TR14'])
+        
+        # 计算 DX 和 ADX
+        df['DX'] = 100 * abs(df['+DI14'] - df['-DI14']) / (df['+DI14'] + df['-DI14'])
+        df['ADX'] = df['DX'].ewm(alpha=alpha, adjust=False).mean()
+        
+        return df
 
-            # 填充 NaN 值
-            rsi = rsi.fillna(50)  # 默认中性值
-
-            # 添加到 DataFrame
-            col_name = f'RSI_{period}'
-            df[col_name] = rsi
-
+    def _calculate_atr(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        计算 ATR (Average True Range)
+        """
+        df = df.copy()
+        # 如果已经计算过 TR (在 ADX 中)，直接使用，否则重新计算
+        if 'TR' not in df.columns:
+            df['H-L'] = df['high'] - df['low']
+            df['H-PC'] = abs(df['high'] - df['close'].shift(1))
+            df['L-PC'] = abs(df['low'] - df['close'].shift(1))
+            df['TR'] = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
+            
+        df['ATR'] = df['TR'].rolling(window=self.ATR_PERIOD).mean()
         return df
     
     def _analyze_trend(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
@@ -387,6 +457,94 @@ class StockTrendAnalyzer:
             result.trend_status = TrendStatus.CONSOLIDATION
             result.ma_alignment = "均线缠绕，趋势不明"
             result.trend_strength = 50
+
+    def _analyze_candlestick_patterns(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
+        """
+        分析K线形态 (重点关注 MA10/MA20 支撑位的形态)
+        
+        关注形态：
+        1. 锤子线 (Hammer) - 类似 'mer'
+        2. 看涨吞没 (Bullish Engulfing)
+        3. 早晨之星 (Morning Star)
+        """
+        if len(df) < 5:
+            return
+
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        prev2 = df.iloc[-3]
+        
+        close = latest['close']
+        open_ = latest['open']
+        high = latest['high']
+        low = latest['low']
+        
+        # 定义形态判断函数
+        def is_hammer(row):
+            """锤子线：下影线长，实体小，无上影线或很短"""
+            body = abs(row['close'] - row['open'])
+            lower_shadow = min(row['close'], row['open']) - row['low']
+            upper_shadow = row['high'] - max(row['close'], row['open'])
+            return lower_shadow > 2 * body and upper_shadow < body * 0.5
+
+        def is_bullish_engulfing(curr, prev):
+            """看涨吞没：前阴后阳，阳线实体完全包住阴线实体"""
+            prev_body = abs(prev['close'] - prev['open'])
+            curr_body = abs(curr['close'] - curr['open'])
+            
+            is_prev_bear = prev['close'] < prev['open']
+            is_curr_bull = curr['close'] > curr['open']
+            
+            return (is_prev_bear and is_curr_bull and 
+                    curr['close'] > prev['open'] and 
+                    curr['open'] < prev['close'])
+
+        def is_morning_star(curr, prev, prev2):
+            """早晨之星：跌-星-涨"""
+            is_prev2_bear = prev2['close'] < prev2['open']
+            is_prev_star = abs(prev['close'] - prev['open']) < abs(prev2['close'] - prev2['open']) * 0.5
+            is_curr_bull = curr['close'] > curr['open']
+            
+            # 第三根K线收盘价深入第一根K线实体一半以上
+            mid_point = (prev2['open'] + prev2['close']) / 2
+            
+            return (is_prev2_bear and is_prev_star and is_curr_bull and 
+                    curr['close'] > mid_point)
+
+        # 检查支撑位条件 (MA10 或 MA20 附近)
+        support_condition = False
+        support_desc = ""
+        
+        # 检查是否回踩 MA10
+        if result.ma10 > 0:
+            dist_ma10 = abs(low - result.ma10) / result.ma10
+            if dist_ma10 < 0.02 and min(open_, close) >= result.ma10 * 0.98:
+                support_condition = True
+                support_desc = "MA10"
+
+        # 检查是否回踩 MA20
+        if not support_condition and result.ma20 > 0:
+            dist_ma20 = abs(low - result.ma20) / result.ma20
+            if dist_ma20 < 0.02 and min(open_, close) >= result.ma20 * 0.98:
+                support_condition = True
+                support_desc = "MA20"
+        
+        if not support_condition:
+            return
+
+        # 形态判定
+        pattern = ""
+        
+        if is_bullish_engulfing(latest, prev):
+            pattern = "看涨吞没"
+        elif is_hammer(latest):
+            pattern = "锤子线"
+        elif is_morning_star(latest, prev, prev2):
+            pattern = "早晨之星"
+            
+        if pattern:
+            result.candlestick_pattern = pattern
+            result.candlestick_signal = f"✅ {support_desc}支撑位出现{pattern}，看涨信号"
     
     def _calculate_bias(self, result: TrendAnalysisResult) -> None:
         """
@@ -579,23 +737,45 @@ class StockTrendAnalyzer:
             result.rsi_status = RSIStatus.OVERSOLD
             result.rsi_signal = f"⭐ RSI超卖({rsi_mid:.1f}<30)，反弹机会大"
 
+    def _analyze_adx_atr(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
+        """
+        分析 ADX 和 ATR 指标
+        """
+        if len(df) < self.ADX_PERIOD:
+            return
+
+        latest = df.iloc[-1]
+        
+        # ADX 分析
+        result.adx = float(latest.get('ADX', 0))
+        if result.adx > self.ADX_THRESHOLD:
+            result.adx_status = f"趋势强劲(ADX={result.adx:.1f})"
+        else:
+            result.adx_status = f"趋势震荡(ADX={result.adx:.1f})"
+            
+        # ATR 分析
+        result.atr = float(latest.get('ATR', 0))
+        if result.current_price > 0:
+            result.atr_percent = (result.atr / result.current_price) * 100
+
     def _generate_signal(self, result: TrendAnalysisResult) -> None:
         """
-        生成买入信号
+        生成买入信号 (已升级：加入ATR动态波动率过滤 + 止损计算)
 
         综合评分系统：
         - 趋势（30分）：多头排列得分高
-        - 乖离率（20分）：接近 MA5 得分高
+        - 乖离率（20分）：基于 ATR 的动态波动率判断
         - 量能（15分）：缩量回调得分高
         - 支撑（10分）：获得均线支撑得分高
         - MACD（15分）：金叉和多头得分高
         - RSI（10分）：超卖和强势得分高
+        - 附加分：ADX强度 + K线形态
         """
         score = 0
         reasons = []
         risks = []
 
-        # === 趋势评分（30分）===
+        # === 1. 趋势评分（30分）===
         trend_scores = {
             TrendStatus.STRONG_BULL: 30,
             TrendStatus.BULL: 26,
@@ -613,30 +793,42 @@ class StockTrendAnalyzer:
         elif result.trend_status in [TrendStatus.BEAR, TrendStatus.STRONG_BEAR]:
             risks.append(f"⚠️ {result.trend_status.value}，不宜做多")
 
-        # === 乖离率评分（20分）===
+        # === 2. 乖离率评分 (ATR 动态版)（20分）===
+        # 逻辑：不再使用固定5%，而是使用 ATR 的倍数
+        # 1 ATR 以内 = 安全买入区
+        # 2 ATR 以外 = 超买区 (风险高)
+        
         bias = result.bias_ma5
+        atr_pct = result.atr_percent if result.atr_percent > 0 else 2.5 # 默认2.5%防止除零
+        
+        # 定义动态阈值
+        safe_zone = 1.0 * atr_pct      # 1倍ATR波动
+        danger_zone = 2.0 * atr_pct    # 2倍ATR波动 (相当于布林带上轨)
+
         if bias < 0:
             # 价格在 MA5 下方（回调中）
-            if bias > -3:
+            if bias > -safe_zone:
                 score += 20
-                reasons.append(f"✅ 价格略低于MA5({bias:.1f}%)，回踩买点")
-            elif bias > -5:
-                score += 16
-                reasons.append(f"✅ 价格回踩MA5({bias:.1f}%)，观察支撑")
+                reasons.append(f"✅ 温和回调 ({bias:.2f}%)，在1倍ATR安全范围内")
+            elif bias > -danger_zone:
+                score += 15
+                reasons.append(f"✅ 深度回调 ({bias:.2f}%)，接近2倍ATR，关注支撑")
             else:
-                score += 8
-                risks.append(f"⚠️ 乖离率过大({bias:.1f}%)，可能破位")
-        elif bias < 2:
-            score += 18
-            reasons.append(f"✅ 价格贴近MA5({bias:.1f}%)，介入好时机")
-        elif bias < self.BIAS_THRESHOLD:
-            score += 14
-            reasons.append(f"⚡ 价格略高于MA5({bias:.1f}%)，可小仓介入")
+                score += 5
+                risks.append(f"⚠️ 跌幅过大 (>{danger_zone:.2f}%)，恐慌抛售中")
         else:
-            score += 4
-            risks.append(f"❌ 乖离率过高({bias:.1f}%>5%)，严禁追高！")
+            # 价格在 MA5 上方（上涨中）
+            if bias < safe_zone:
+                score += 18
+                reasons.append(f"✅ 上涨初期 ({bias:.2f}%)，未偏离均线")
+            elif bias < danger_zone:
+                score += 10
+                reasons.append(f"⚡ 趋势加速 ({bias:.2f}%)，但未超买")
+            else:
+                score += 0
+                risks.append(f"❌ 严重超买 ({bias:.2f}% > {danger_zone:.2f}%)，严禁追高")
 
-        # === 量能评分（15分）===
+        # === 3. 量能评分（15分）===
         volume_scores = {
             VolumeStatus.SHRINK_VOLUME_DOWN: 15,  # 缩量回调最佳
             VolumeStatus.HEAVY_VOLUME_UP: 12,     # 放量上涨次之
@@ -652,63 +844,76 @@ class StockTrendAnalyzer:
         elif result.volume_status == VolumeStatus.HEAVY_VOLUME_DOWN:
             risks.append("⚠️ 放量下跌，注意风险")
 
-        # === 支撑评分（10分）===
+        # === 4. 支撑评分（10分）===
         if result.support_ma5:
             score += 5
-            reasons.append("✅ MA5支撑有效")
+            reasons.append("✅ 获得MA5支撑")
         if result.support_ma10:
             score += 5
-            reasons.append("✅ MA10支撑有效")
+            reasons.append("✅ 获得MA10支撑")
 
-        # === MACD 评分（15分）===
+        # === 5. MACD 评分（15分）===
         macd_scores = {
             MACDStatus.GOLDEN_CROSS_ZERO: 15,  # 零轴上金叉最强
             MACDStatus.GOLDEN_CROSS: 12,      # 金叉
             MACDStatus.CROSSING_UP: 10,       # 上穿零轴
             MACDStatus.BULLISH: 8,            # 多头
             MACDStatus.BEARISH: 2,            # 空头
-            MACDStatus.CROSSING_DOWN: 0,       # 下穿零轴
+            MACDStatus.CROSSING_DOWN: 0,      # 下穿零轴
             MACDStatus.DEATH_CROSS: 0,        # 死叉
         }
-        macd_score = macd_scores.get(result.macd_status, 5)
-        score += macd_score
+        score += macd_scores.get(result.macd_status, 5)
 
         if result.macd_status in [MACDStatus.GOLDEN_CROSS_ZERO, MACDStatus.GOLDEN_CROSS]:
             reasons.append(f"✅ {result.macd_signal}")
-        elif result.macd_status in [MACDStatus.DEATH_CROSS, MACDStatus.CROSSING_DOWN]:
-            risks.append(f"⚠️ {result.macd_signal}")
-        else:
-            reasons.append(result.macd_signal)
 
-        # === RSI 评分（10分）===
-        rsi_scores = {
-            RSIStatus.OVERSOLD: 10,       # 超卖最佳
-            RSIStatus.STRONG_BUY: 8,     # 强势
-            RSIStatus.NEUTRAL: 5,        # 中性
-            RSIStatus.WEAK: 3,            # 弱势
-            RSIStatus.OVERBOUGHT: 0,       # 超买最差
-        }
-        rsi_score = rsi_scores.get(result.rsi_status, 5)
-        score += rsi_score
+        # === 6. RSI 评分（10分）===
+        rsi_mid = result.rsi_12
+        if 40 <= rsi_mid <= 60:
+            score += 5   # 中性
+        elif 60 < rsi_mid <= 70:
+            score += 8   # 强势
+            reasons.append(f"✅ RSI强势({rsi_mid:.1f})")
+        elif rsi_mid < 30:
+            score += 10  # 超卖
+            reasons.append(f"⭐ RSI超卖({rsi_mid:.1f})，反弹概率大")
+        elif rsi_mid > 70:
+            score += 0   # 超买
+            risks.append(f"⚠️ RSI超买({rsi_mid:.1f})，回调风险")
 
-        if result.rsi_status in [RSIStatus.OVERSOLD, RSIStatus.STRONG_BUY]:
-            reasons.append(f"✅ {result.rsi_signal}")
-        elif result.rsi_status == RSIStatus.OVERBOUGHT:
-            risks.append(f"⚠️ {result.rsi_signal}")
-        else:
-            reasons.append(result.rsi_signal)
+        # === 7. 加分项 (ADX & K线) ===
+        
+        # ADX 趋势强度加分 (Max 5分)
+        if result.adx > self.ADX_THRESHOLD:
+            score += 5
+            reasons.append(f"🔥 {result.adx_status}")
+            
+        # K线形态加分 (Max 15分)
+        if result.candlestick_pattern:
+            score += 15
+            reasons.append(result.candlestick_signal)
 
-        # === 综合判断 ===
-        result.signal_score = score
+        # === 8. 🛡️ 止损位计算 (关键风控) ===
+        if result.atr > 0:
+            # 止损公式：当前价格 - 2倍 ATR
+            stop_loss = result.current_price - (2.0 * result.atr)
+            
+            # 如果你有在 TrendAnalysisResult 定义 stop_loss_price 字段，请取消注释下面这行
+            result.stop_loss_price = stop_loss # 将止损位保存到结果中
+            
+            reasons.append(f"🛡️ 建议止损位: {stop_loss:.2f} (2x ATR)")
+
+        # === 9. 综合决策 ===
+        result.signal_score = min(score, 100)
         result.signal_reasons = reasons
         result.risk_factors = risks
 
-        # 生成买入信号（调整阈值以适应新的100分制）
-        if score >= 75 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL]:
+        # 生成买入信号
+        if score >= 80 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL]:
             result.buy_signal = BuySignal.STRONG_BUY
-        elif score >= 60 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL, TrendStatus.WEAK_BULL]:
+        elif score >= 65 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL, TrendStatus.WEAK_BULL]:
             result.buy_signal = BuySignal.BUY
-        elif score >= 45:
+        elif score >= 50:
             result.buy_signal = BuySignal.HOLD
         elif score >= 30:
             result.buy_signal = BuySignal.WAIT
@@ -716,7 +921,7 @@ class StockTrendAnalyzer:
             result.buy_signal = BuySignal.STRONG_SELL
         else:
             result.buy_signal = BuySignal.SELL
-    
+
     def format_analysis(self, result: TrendAnalysisResult) -> str:
         """
         格式化分析结果为文本
@@ -756,9 +961,22 @@ class StockTrendAnalyzer:
             f"   RSI(24): {result.rsi_24:.1f}",
             f"   信号: {result.rsi_signal}",
             f"",
+            f"🔥 进阶指标:",
+            f"   ADX趋势: {result.adx:.1f} ({result.adx_status})",
+            f"   ATR波动: {result.atr:.2f} (占比 {result.atr_percent:.1f}%)",
+        ]
+        
+        if result.candlestick_pattern:
+            lines.append(f"   K线形态: {result.candlestick_pattern}")
+
+        lines.extend([
+            f"",
             f"🎯 操作建议: {result.buy_signal.value}",
             f"   综合评分: {result.signal_score}/100",
-        ]
+        ])
+
+        if result.stop_loss_price > 0:
+            lines.append(f"   🛡️ 止损位: {result.stop_loss_price:.2f}")
 
         if result.signal_reasons:
             lines.append(f"")
